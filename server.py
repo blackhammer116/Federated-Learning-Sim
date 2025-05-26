@@ -508,8 +508,8 @@ def run_fl_round():
         threads.append(thread)
         thread.start()
 
-    print(f"Server: Waiting for {len(participating_client_ids)} clients to upload (noised) updates (timeout: 60s)...")
-    if not client_completion_event.wait(timeout=60):
+    print(f"Server: Waiting for {len(participating_client_ids)} clients to upload (noised) updates (timeout: 300s)...")
+    if not client_completion_event.wait(timeout=300):
         print("Server: Timeout waiting for all clients to upload. Aggregating from available clients.")
         pass
 
