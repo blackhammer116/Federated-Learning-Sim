@@ -9,14 +9,12 @@ import threading
 import time
 import random
 import requests # Import requests for the client simulation thread
-
-import warnings
-warnings.filterwarnings('ignore')
+import os # Import os to check for file existence
 
 # --- Flask App Setup ---
 app = Flask(__name__)
 
-# --- Global Variables for FL State (in-memory simulation) ---
+# --- Global Constants for FL State (in-memory simulation) ---
 global_model = None
 # Stores preprocessed tf.data.Dataset for each client, keyed by client_id
 client_data_dict = {} 
@@ -26,22 +24,76 @@ vocab = []
 VOCAB_SIZE = 0
 SEQUENCE_LENGTH = 100
 BATCH_SIZE = 10
-NUM_CLIENTS_PER_ROUND = 5 # Number of clients participating in each round
+NUM_CLIENTS_PER_ROUND = 2 # Number of clients participating in each round
 LOCAL_EPOCHS = 1 # Number of local epochs for each client in a round
 FL_ROUND_COUNT = 0 # To keep track of current FL round
+
+# --- Security Constants for Differential Privacy Simulation ---
+L2_NORM_CLIP = 1.0 
+DP_NOISE_MULTIPLIER = 0.1 
+
+# --- Simulation Heterogeneity Parameters ---
+MIN_CLIENT_DELAY_SECONDS = 1
+MAX_CLIENT_DELAY_SECONDS = 5
+STRAGGLER_DELAY_SECONDS = 15 # Significantly longer delay for stragglers
+STRAGGLER_COUNT = 0 # Number of stragglers per round
+MIN_CLIENT_BATCHES = 5 # Minimum number of batches a client will train on
+MAX_CLIENT_BATCHES = 20 # Maximum number of batches a client will train on
+
+# --- Malicious Client Simulation & Robust Aggregation Parameters ---
+MALICIOUS_CLIENT_COUNT = 0 # Number of clients to simulate as malicious per round
+TRIM_FRACTION = 0.1 # Fraction of updates to trim from each end for trimmed mean (e.g., 0.1 trims 10% from top and 10% from bottom)
+
 
 # For storing metrics history for the dashboard
 fl_metrics_history = [] # List of dictionaries: [{'round': X, 'loss': Y, 'accuracy': Z}]
 
 # Variables for managing client uploads in a round
-# Stores weights uploaded by clients in the current round
-client_weights_buffer = {} 
-# Event to signal when all clients have uploaded for the current round
+client_updates_buffer = {} 
 client_completion_event = threading.Event()
-# Lock to protect shared resources (client_weights_buffer, client_completion_event)
 client_buffer_lock = threading.Lock()
 
 # --- Helper Functions for Data Preprocessing and Model Handling ---
+
+def to_ids(text):
+    """Converts a string of characters to a list of character IDs."""
+    # Ensure text is converted from EagerTensor to numpy bytes before decoding
+    decoded_text = text.numpy().decode('utf-8')
+    ids = [char_to_id.get(c, char_to_id['<unk>']) for c in decoded_text]
+    # Ensure it's never an empty list, return a placeholder if empty
+    if not ids:
+        return tf.constant([char_to_id['<pad>']], dtype=tf.int32)
+    return tf.constant(ids, dtype=tf.int32)
+
+def preprocess_client_dataset(dataset, num_epochs=1, max_batches_to_use=None):
+    """
+    Preprocesses a single client's Shakespeare dataset and repeats it for local epochs.
+    Can limit the number of batches used.
+    """
+    def prepare_sequences(element):
+        text = element['snippets']
+        char_ids = tf.py_function(to_ids, [text], tf.int32)
+        char_ids.set_shape([None])
+
+        dataset = tf.data.Dataset.from_tensor_slices(char_ids)
+        dataset = dataset.window(SEQUENCE_LENGTH + 1, shift=1, drop_remainder=True)
+        dataset = dataset.flat_map(lambda window: window.batch(SEQUENCE_LENGTH + 1))
+        
+        def split_input_target(chunk):
+            input_text = chunk[:-1]
+            target_text = chunk[1:]
+            return (input_text, target_text) 
+
+        return dataset.map(split_input_target)
+
+    processed_dataset = dataset.flat_map(prepare_sequences).shuffle(buffer_size=1000).batch(
+        BATCH_SIZE, drop_remainder=True
+    ).repeat(num_epochs).prefetch(tf.data.AUTOTUNE)
+
+    if max_batches_to_use is not None:
+        processed_dataset = processed_dataset.take(max_batches_to_use)
+
+    return processed_dataset
 
 def load_and_preprocess_shakespeare_data():
     """
@@ -68,13 +120,10 @@ def load_and_preprocess_shakespeare_data():
                 numpy_snippets = snippets_tensor.numpy()
                 
                 # Ensure numpy_snippets is always a numpy array for ndim check
-                # In some TF versions/scenarios, scalar tf.string.numpy() can return raw bytes
-                # rather than a 0-dim numpy array. This ensures consistency.
                 if not isinstance(numpy_snippets, np.ndarray):
                     numpy_snippets = np.array(numpy_snippets)
 
                 if numpy_snippets.ndim == 0: # Scalar tensor, single bytes object
-                    # Extract the scalar bytes object from the 0-dim numpy array using .item()
                     text_content = tf.compat.as_text(numpy_snippets.item()) 
                     all_chars_set.update(text_content)
                 else: # Vector tensor, array of bytes objects
@@ -91,48 +140,15 @@ def load_and_preprocess_shakespeare_data():
     VOCAB_SIZE = len(vocab)
     print(f"Vocabulary size: {VOCAB_SIZE}")
 
-    def to_ids(text):
-        """Converts a string of characters to a list of character IDs."""
-        decoded_text = text.numpy().decode('utf-8')
-        ids = [char_to_id.get(c, char_to_id['<unk>']) for c in decoded_text]
-        # Ensure it's never an empty list, return a placeholder if empty
-        if not ids:
-            return tf.constant([char_to_id['<pad>']], dtype=tf.int32) # Return a single pad token if empty
-        return tf.constant(ids, dtype=tf.int32)
-
-    def preprocess_client_dataset(dataset, num_epochs=1):
-        """
-        Preprocesses a single client's Shakespeare dataset and repeats it for local epochs.
-        """
-        def prepare_sequences(element):
-            text = element['snippets']
-            char_ids = tf.py_function(to_ids, [text], tf.int32)
-            char_ids.set_shape([None]) # This indicates it's a 1D tensor of unknown length
-
-            dataset = tf.data.Dataset.from_tensor_slices(char_ids)
-            dataset = dataset.window(SEQUENCE_LENGTH + 1, shift=1, drop_remainder=True)
-            dataset = dataset.flat_map(lambda window: window.batch(SEQUENCE_LENGTH + 1))
-            
-            def split_input_target(chunk):
-                input_text = chunk[:-1]
-                target_text = chunk[1:]
-                # --- KEY CHANGE: Return a tuple (input, target) instead of OrderedDict ---
-                return (input_text, target_text) 
-
-            return dataset.map(split_input_target)
-
-        return dataset.flat_map(prepare_sequences).shuffle(buffer_size=1000).batch(
-            BATCH_SIZE, drop_remainder=True
-        ).repeat(num_epochs).prefetch(tf.data.AUTOTUNE)
-
-    # Select the first N clients for our simulation
-    # These are the actual clients whose data will be used in FL rounds
-    selected_client_ids = train_data.client_ids[:NUM_CLIENTS_PER_ROUND]
-    for client_id in selected_client_ids:
+    # Preload data for all potential clients, but don't limit batches yet.
+    # Batch limiting will happen when clients are selected for a round.
+    all_available_client_ids = train_data.client_ids 
+    for client_id in all_available_client_ids:
+        # Pass None for max_batches_to_use here, actual limiting happens per round
         client_data_dict[client_id] = preprocess_client_dataset(
-            train_data.create_tf_dataset_for_client(client_id), num_epochs=LOCAL_EPOCHS
+            train_data.create_tf_dataset_for_client(client_id), num_epochs=LOCAL_EPOCHS, max_batches_to_use=None
         )
-    print(f"Loaded data for {len(client_data_dict)} clients participating in FL.")
+    print(f"Loaded data for {len(client_data_dict)} total available clients.")
 
 def create_keras_model():
     """Builds a simple character-level RNN model."""
@@ -156,30 +172,140 @@ def weights_to_json(weights):
     return [w.tolist() for w in weights]
 
 def json_to_weights(json_weights):
-    """Converts JSON-serialized weights back to numpy arrays with correct shapes."""
-    # Create a dummy model to get the correct weight shapes and dtypes
+    """
+    Converts JSON-serialized weights back to numpy arrays with correct shapes and dtypes.
+    Performs strict structural validation.
+    """
     dummy_model = create_keras_model()
     dummy_weights = dummy_model.get_weights()
     
+    if len(json_weights) != len(dummy_weights):
+        raise ValueError(
+            f"Uploaded weights have {len(json_weights)} layers, "
+            f"but expected {len(dummy_weights)} layers based on model architecture."
+        )
+
     numpy_weights = []
     for i, w_list in enumerate(json_weights):
-        # Ensure the numpy array has the correct shape and dtype from the dummy model
-        numpy_weights.append(np.array(w_list, dtype=dummy_weights[i].dtype))
+        try:
+            converted_w = np.array(w_list)
+        except Exception as e:
+            raise ValueError(f"Could not convert uploaded weight list for layer {i} to numpy array: {e}")
+
+        if converted_w.shape != dummy_weights[i].shape:
+            raise ValueError(
+                f"Shape mismatch for layer {i}: Uploaded shape {converted_w.shape}, "
+                f"expected shape {dummy_weights[i].shape}."
+            )
+        
+        if converted_w.dtype != dummy_weights[i].dtype:
+             print(f"Warning: Dtype mismatch for layer {i}. Uploaded: {converted_w.dtype}, Expected: {dummy_weights[i].dtype}. Attempting conversion.")
+             converted_w = converted_w.astype(dummy_weights[i].dtype)
+             if converted_w.dtype != dummy_weights[i].dtype:
+                 raise ValueError(f"Dtype mismatch for layer {i}: Uploaded dtype {converted_w.dtype}, expected dtype {dummy_weights[i].dtype}. Conversion failed.")
+
+        numpy_weights.append(converted_w)
     return numpy_weights
 
-def aggregate_weights(client_weights_list):
-    """Performs federated averaging of client weights."""
-    if not client_weights_list:
+def updates_to_json(updates):
+    """Converts a list of numpy update arrays to JSON-serializable format."""
+    return [u.tolist() for u in updates]
+
+def json_to_updates(json_updates):
+    """Converts JSON-serialized updates back to numpy arrays with correct shapes and dtypes."""
+    # Updates should have the same structure as weights
+    return json_to_weights(json_updates)
+
+def calculate_l2_norm(arrays):
+    """Calculates the L2 norm of a flattened list of numpy arrays."""
+    flat_arrays = np.concatenate([arr.flatten() for arr in arrays])
+    return np.linalg.norm(flat_arrays)
+
+def clip_l2_norm(updates, clip_norm):
+    """Clips the L2 norm of the updates."""
+    current_norm = calculate_l2_norm(updates)
+    if current_norm > clip_norm:
+        scaling_factor = clip_norm / current_norm
+        return [u * scaling_factor for u in updates]
+    return updates
+
+def add_gaussian_noise(updates, noise_multiplier, clip_norm):
+    """Adds Gaussian noise to updates for differential privacy."""
+    noisy_updates = []
+    for u in updates:
+        noise_std = noise_multiplier * clip_norm
+        noise = np.random.normal(loc=0.0, scale=noise_std, size=u.shape).astype(u.dtype)
+        noisy_updates.append(u + noise)
+    return noisy_updates
+
+def aggregate_updates(client_updates_list):
+    """Performs federated averaging of client updates."""
+    if not client_updates_list:
         return None
 
-    num_clients = len(client_weights_list)
-    aggregated_weights = [np.zeros_like(w) for w in client_weights_list[0]]
+    num_clients = len(client_updates_list)
+    # Initialize aggregated_updates with zeros, using the shape of the first client's update
+    aggregated_updates = [np.zeros_like(u) for u in client_updates_list[0]]
 
-    for client_weights in client_weights_list:
-        for i in range(len(aggregated_weights)):
-            aggregated_weights[i] += client_weights[i]
+    for client_updates in client_updates_list:
+        for i in range(len(aggregated_updates)):
+            aggregated_updates[i] += client_updates[i]
 
-    return [w / num_clients for w in aggregated_weights]
+    return [u / num_clients for u in aggregated_updates]
+
+def trimmed_mean_aggregate_updates(client_updates_list, trim_fraction):
+    """
+    Performs trimmed mean aggregation of client updates.
+    Removes a fraction of outliers from both ends before averaging.
+    """
+    if not client_updates_list:
+        return None
+
+    num_clients = len(client_updates_list)
+    num_to_trim = int(num_clients * trim_fraction)
+    
+    # If not enough clients to trim, fall back to simple averaging
+    if num_clients < 2 * num_to_trim + 1:
+        print(f"Warning: Not enough clients ({num_clients}) for trimmed mean with trim_fraction={trim_fraction}. "
+              f"Falling back to simple averaging. Need at least {2 * num_to_trim + 1} clients for trimming.")
+        return aggregate_updates(client_updates_list)
+
+    # Initialize aggregated_updates with zeros, using the shape of the first client's update
+    aggregated_updates = [np.zeros_like(u) for u in client_updates_list[0]]
+
+    # Iterate through each weight tensor (layer)
+    for i in range(len(client_updates_list[0])):
+        # Stack the i-th weight tensor from all clients
+        # This creates a (num_clients, ...) shaped array for the current weight
+        stacked_weights = np.array([client_updates[i] for client_updates in client_updates_list])
+        
+        # Flatten the current weight tensor for sorting and trimming
+        original_shape = stacked_weights.shape[1:] # Store original shape for reshaping later
+        flattened_weights = stacked_weights.reshape(num_clients, -1) # (num_clients, num_elements_in_weight)
+
+        trimmed_flattened_weights = np.zeros_like(flattened_weights[0], dtype=flattened_weights.dtype) # Initialize with shape of one flattened weight
+
+        # Apply trimmed mean element-wise across the flattened weights
+        for j in range(flattened_weights.shape[1]): # Iterate over each element in the flattened weight
+            column_values = flattened_weights[:, j]
+            
+            # Sort the values and trim
+            sorted_values = np.sort(column_values)
+            trimmed_values = sorted_values[num_to_trim : len(sorted_values) - num_to_trim]
+            
+            # Calculate the mean of the trimmed values
+            if len(trimmed_values) > 0:
+                trimmed_mean = np.mean(trimmed_values)
+            else:
+                trimmed_mean = 0.0 
+            
+            trimmed_flattened_weights[j] = trimmed_mean
+        
+        # Reshape back to original weight tensor shape and store
+        aggregated_updates[i] = trimmed_flattened_weights.reshape(original_shape)
+
+    return aggregated_updates
+
 
 def generate_text(model, start_string, num_generate=500, temperature=0.7):
     """
@@ -190,34 +316,24 @@ def generate_text(model, start_string, num_generate=500, temperature=0.7):
         return "Error: Vocabulary not initialized. Please initialize FL first."
 
     input_eval = [char_to_id.get(s, char_to_id['<unk>']) for s in start_string]
-    # Ensure input_eval has at least SEQUENCE_LENGTH tokens, pad if necessary
     if len(input_eval) < SEQUENCE_LENGTH:
         input_eval = [char_to_id['<pad>']] * (SEQUENCE_LENGTH - len(input_eval)) + input_eval
-    input_eval = input_eval[-SEQUENCE_LENGTH:] # Take last SEQUENCE_LENGTH tokens
-
-    input_eval = tf.expand_dims(input_eval, 0) # Add batch dimension
+    input_eval = tf.constant(input_eval[-SEQUENCE_LENGTH:], dtype=tf.int32)
+    input_eval = tf.expand_dims(input_eval, 0)
 
     text_generated = []
     
-    # Keras GRU layers in Sequential model might not expose reset_states easily
-    # For generation, it's often better to build a model that explicitly handles state
-    # or just rely on the model processing one character at a time.
-    # For simplicity, we'll use the current model as is.
-    # If the model was stateful=True and built with batch_input_shape, you'd use model.reset_states()
-
     for i in range(num_generate):
         predictions = model(input_eval)
-        predictions = tf.squeeze(predictions, 0) # Remove the batch dimension
-
-        # Get prediction for the last character in the sequence
-        predictions = predictions[-1, :] # Get logits for the last time step
+        predictions = tf.squeeze(predictions, 0)
+        predictions = predictions[-1:] 
 
         predictions = predictions / temperature
-        predicted_id = tf.random.categorical(predictions, num_samples=1)[0].numpy()
+        predicted_id = tf.random.categorical(predictions, num_samples=1)[0]
+        predicted_id = tf.cast(predicted_id, tf.int32)
 
-        # Append predicted_id to input_eval and take the last SEQUENCE_LENGTH for next step
-        input_eval = tf.concat([input_eval[:, 1:], tf.expand_dims([predicted_id], 0)], axis=1)
-        text_generated.append(id_to_char[predicted_id])
+        input_eval = tf.concat([input_eval[:, 1:], tf.expand_dims(predicted_id, 0)], axis=1)
+        text_generated.append(id_to_char[predicted_id.numpy()[0]])
 
     return start_string + ''.join(text_generated)
 
@@ -226,7 +342,6 @@ def generate_text(model, start_string, num_generate=500, temperature=0.7):
 @app.route('/')
 def index():
     """Renders the main HTML page."""
-    # Assuming index.html is now in a 'templates' directory
     return render_template('index.html', fl_round_count=FL_ROUND_COUNT)
 
 @app.route('/init_fl', methods=['POST'])
@@ -235,19 +350,35 @@ def init_fl():
     global global_model, FL_ROUND_COUNT, fl_metrics_history
 
     try:
-        # Load and preprocess data for all clients
         load_and_preprocess_shakespeare_data()
-
-        # Initialize the global model
         global_model = create_keras_model()
-        # No need to compile here, compilation happens on client side for local training
-        # and when evaluating the global model.
+
+        pretrain_weights_path = 'initial_model_weights.json'
+        if os.path.exists(pretrain_weights_path):
+            print(f"Server: Found pre-trained weights at {pretrain_weights_path}. Loading...")
+            with open(pretrain_weights_path, 'r') as f:
+                pretrain_weights_json = json.load(f)
+            
+            try:
+                pretrain_weights = json_to_weights(pretrain_weights_json)
+                set_model_weights(global_model, pretrain_weights)
+                print("Server: Pre-trained weights loaded successfully.")
+            except ValueError as ve:
+                print(f"Server: Error loading pre-trained weights due to structural mismatch: {ve}. Initializing with random weights.")
+            except Exception as e:
+                print(f"Server: Unexpected error loading pre-trained weights: {e}. Initializing with random weights.")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("Server: No pre-trained weights found. Initializing model with random weights.")
         
         FL_ROUND_COUNT = 0
-        fl_metrics_history = [] # Clear history on init
+        fl_metrics_history = []
         return jsonify(status="success", message="FL initialized", fl_round_count=FL_ROUND_COUNT)
     except Exception as e:
         print(f"Error during FL initialization: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify(status="error", message=str(e)), 500
 
 @app.route('/download_model', methods=['GET'])
@@ -261,32 +392,48 @@ def download_model():
 
 @app.route('/upload_weights', methods=['POST'])
 def upload_weights():
-    """Endpoint for clients to upload their trained local model weights."""
+    """
+    Endpoint for clients to upload their trained local model updates (deltas).
+    These updates are expected to be clipped and noised for differential privacy.
+    """
     data = request.get_json()
     client_id = data.get('client_id')
-    json_weights = data.get('weights')
+    json_updates = data.get('updates') # Now expecting 'updates' not 'weights'
     local_metrics = data.get('metrics', {})
 
-    if not client_id or not json_weights:
-        return jsonify(status="error", message="Missing client_id or weights."), 400
+    if not client_id or not json_updates:
+        return jsonify(status="error", message="Missing client_id or updates."), 400
 
-    with client_buffer_lock:
-        if client_id not in client_weights_buffer: # Only accept first upload per client per round
-            client_weights_buffer[client_id] = json_to_weights(json_weights)
-            print(f"\nServer: Received weights from client {client_id}. Local metrics: {local_metrics}")
-            # Check if all expected clients have uploaded
-            if len(client_weights_buffer) == NUM_CLIENTS_PER_ROUND:
-                client_completion_event.set() # Signal that all clients have uploaded
-    
-    return jsonify(status="success", message="Weights received.")
+    try:
+        client_updates = json_to_updates(json_updates)
+        
+        with client_buffer_lock:
+            if client_id not in client_updates_buffer:
+                client_updates_buffer[client_id] = client_updates
+                print(f"Server: Received (noised) updates from client {client_id}. Local metrics: {local_metrics}")
+                
+                if len(client_updates_buffer) == NUM_CLIENTS_PER_ROUND:
+                    client_completion_event.set()
+        
+        return jsonify(status="success", message="Updates received and validated.")
+    except ValueError as ve:
+        print(f"Server: Client {client_id} uploaded malformed updates: {ve}. Rejecting.")
+        return jsonify(status="error", message=f"Malformed updates: {ve}"), 400
+    except Exception as e:
+        print(f"Server: An unexpected error occurred during update upload from client {client_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify(status="error", message=f"Server error during update upload: {e}"), 500
 
 @app.route('/run_fl_round', methods=['POST'])
 def run_fl_round():
     """
     Simulates one federated learning round by triggering client threads
     and waiting for their completion.
+    Includes partial participation, straggler simulation, varying data volumes,
+    and malicious client simulation with robust aggregation.
     """
-    global global_model, FL_ROUND_COUNT, fl_metrics_history, client_weights_buffer
+    global global_model, FL_ROUND_COUNT, fl_metrics_history, client_updates_buffer
 
     if global_model is None:
         return jsonify(status="error", message="FL not initialized. Please run /init_fl first."), 400
@@ -294,48 +441,111 @@ def run_fl_round():
     FL_ROUND_COUNT += 1
     print(f"\n--- Starting Federated Round {FL_ROUND_COUNT} ---")
 
-    # Reset buffer and event for the new round
     with client_buffer_lock:
-        client_weights_buffer.clear()
+        client_updates_buffer.clear()
         client_completion_event.clear()
 
-    # Get the list of client IDs that will participate in this round
-    # In a real scenario, this would be a selection process.
-    # Here, we use the pre-selected clients from client_data_dict.
-    participating_client_ids = list(client_data_dict.keys())
+    all_available_client_ids = list(client_data_dict.keys())
     
-    # Spawn threads for each client
+    # 1. Simulate partial participation: Randomly select NUM_CLIENTS_PER_ROUND
+    if len(all_available_client_ids) < NUM_CLIENTS_PER_ROUND:
+        print(f"Warning: Not enough clients ({len(all_available_client_ids)}) to meet NUM_CLIENTS_PER_ROUND ({NUM_CLIENTS_PER_ROUND}). Using all available clients.")
+        participating_client_ids = all_available_client_ids
+    else:
+        participating_client_ids = random.sample(all_available_client_ids, NUM_CLIENTS_PER_ROUND)
+    
+    print(f"Server: Participating clients for round {FL_ROUND_COUNT}: {participating_client_ids}")
+
+    # 2. Assign varying delays, data volumes, and malicious flags
+    client_configs = {}
+    
+    # Select stragglers
+    straggler_indices = random.sample(range(len(participating_client_ids)), min(STRAGGLER_COUNT, len(participating_client_ids)))
+    
+    # Select malicious clients (ensure not more than available clients, and not more than can be trimmed)
+    # Malicious clients should ideally be distinct from stragglers for clearer observation
+    num_potential_malicious = len(participating_client_ids) - len(straggler_indices)
+    malicious_client_indices = []
+    if num_potential_malicious > 0:
+        malicious_client_indices = random.sample(
+            [i for i in range(len(participating_client_ids)) if i not in straggler_indices],
+            min(MALICIOUS_CLIENT_COUNT, num_potential_malicious)
+        )
+
+    for i, client_id in enumerate(participating_client_ids):
+        simulated_delay = random.uniform(MIN_CLIENT_DELAY_SECONDS, MAX_CLIENT_DELAY_SECONDS)
+        max_batches = random.randint(MIN_CLIENT_BATCHES, MAX_CLIENT_BATCHES)
+        is_malicious = False
+
+        if i in straggler_indices:
+            simulated_delay = STRAGGLER_DELAY_SECONDS # Make this client a straggler
+            print(f"Server: Client {client_id} assigned as STRAGGLER (delay={simulated_delay}s, batches={max_batches}).")
+        
+        if i in malicious_client_indices:
+            is_malicious = True
+            print(f"Server: Client {client_id} assigned as MALICIOUS (delay={simulated_delay}s, batches={max_batches}).")
+            
+        client_configs[client_id] = {
+            'simulated_delay_seconds': simulated_delay,
+            'max_batches_to_use': max_batches,
+            'is_malicious': is_malicious
+        }
+
+    # Spawn threads for each participating client
     threads = []
     for client_id in participating_client_ids:
-        # Pass server URL and client_id to the client script
-        thread = threading.Thread(target=simulate_client_training, args=(client_id, "http://127.0.0.1:5000"))
+        config = client_configs[client_id]
+        thread = threading.Thread(
+            target=simulate_client_training, 
+            args=(
+                client_id, 
+                "http://127.0.0.1:5000", 
+                config['simulated_delay_seconds'], 
+                config['max_batches_to_use'],
+                config['is_malicious'] # Pass malicious flag
+            )
+        )
         threads.append(thread)
         thread.start()
 
-    # Wait for all clients to upload their weights (with a timeout)
-    print(f"Server: Waiting for {NUM_CLIENTS_PER_ROUND} clients to upload weights...")
-    if not client_completion_event.wait(timeout=300): # 5 minute timeout
+    print(f"Server: Waiting for {len(participating_client_ids)} clients to upload (noised) updates (timeout: 60s)...")
+    if not client_completion_event.wait(timeout=60):
         print("Server: Timeout waiting for all clients to upload. Aggregating from available clients.")
-        # Decide how to handle missing clients: aggregate from available, or fail.
-        # For this simulation, we'll aggregate from whatever we got.
         pass
 
     with client_buffer_lock:
-        if not client_weights_buffer:
-            print("No client weights received. Skipping aggregation.")
+        if not client_updates_buffer:
+            print("No client updates received. Skipping aggregation.")
             return jsonify(status="error", message="No clients provided updates in this round."), 500
         
-        # Aggregate client updates
-        print(f"Server: Aggregating weights from {len(client_weights_buffer)} clients.")
-        client_updates_list = list(client_weights_buffer.values())
-        aggregated_weights = aggregate_weights(client_updates_list)
+        print(f"Server: Aggregating (noised) updates from {len(client_updates_buffer)} clients using Trimmed Mean (trim_fraction={TRIM_FRACTION}).")
+        client_updates_list = list(client_updates_buffer.values())
         
-        # Update the global model with aggregated weights
-        set_model_weights(global_model, aggregated_weights)
-        print("Server: Global model updated.")
+        # --- Use Trimmed Mean Aggregation ---
+        averaged_update = trimmed_mean_aggregate_updates(client_updates_list, TRIM_FRACTION)
+        if averaged_update is None: # Fallback if trimmed mean cannot be performed (e.g., too few clients)
+            print("Server: Trimmed mean aggregation failed or returned None. Falling back to simple averaging.")
+            averaged_update = aggregate_updates(client_updates_list)
 
-        # Optional: Evaluate the global model after aggregation (can be slow)
-        # Create a dummy model for evaluation purposes
+
+        current_global_weights = get_model_weights(global_model)
+        new_global_weights = [
+            global_w + avg_u for global_w, avg_u in zip(current_global_weights, averaged_update)
+        ]
+        set_model_weights(global_model, new_global_weights)
+        print("Server: Global model updated with aggregated (noised) updates.")
+
+        output_filename = 'latest_global_model_weights.json'
+        try:
+            weights_to_save = get_model_weights(global_model)
+            with open(output_filename, 'w') as f:
+                json.dump(weights_to_json(weights_to_save), f)
+            print(f"Server: Global model weights saved to {output_filename} after round {FL_ROUND_COUNT}.")
+        except Exception as e:
+            print(f"Server: Error saving global model weights after round {FL_ROUND_COUNT}: {e}")
+            import traceback
+            traceback.print_exc()
+
         eval_model = create_keras_model()
         set_model_weights(eval_model, get_model_weights(global_model))
         eval_model.compile(
@@ -343,34 +553,39 @@ def run_fl_round():
             metrics=[tf.keras.metrics.SparseCategoricalAccuracy()]
         )
         
-        # Using a dummy client's test data for evaluation for simplicity
-        # This is not ideal for true global model evaluation, but serves for simulation
-        # of seeing *some* metric change.
         if participating_client_ids:
             sample_client_id_for_eval = participating_client_ids[0]
-            # Create a small test dataset from the *original* test_data for a client
-            # to avoid using the same data used for training.
             _, raw_test_data = tff.simulation.datasets.shakespeare.load_data()
+            
+            # For evaluation, we use the full preprocessed dataset of a sample client
+            # to get a more stable evaluation metric.
             preprocessed_test_dataset = preprocess_client_dataset(
-                raw_test_data.create_tf_dataset_for_client(sample_client_id_for_eval), num_epochs=1
+                raw_test_data.create_tf_dataset_for_client(sample_client_id_for_eval), num_epochs=1, max_batches_to_use=None
             )
             
-            # Evaluate only a few batches to keep it fast
             eval_batches = preprocessed_test_dataset.take(5) 
             
+            # --- Debugged: Check if eval_batches is empty before evaluating ---
             try:
+                # Attempt to get one batch to check if the dataset is empty
+                _ = next(iter(eval_batches))
+                # If successful, proceed with evaluation
                 eval_results = eval_model.evaluate(eval_batches, verbose=0)
                 eval_loss = eval_results[0]
                 eval_accuracy = eval_results[1]
                 print(f"Server: Global Model Evaluation (Round {FL_ROUND_COUNT}): Loss={eval_loss:.4f}, Accuracy={eval_accuracy:.4f}")
                 fl_metrics_history.append({'round': FL_ROUND_COUNT, 'loss': float(eval_loss), 'accuracy': float(eval_accuracy)})
+            except StopIteration:
+                print(f"Server: Evaluation dataset for client {sample_client_id_for_eval} is empty after taking 5 batches. Skipping global model evaluation for this round.")
+                fl_metrics_history.append({'round': FL_ROUND_COUNT, 'loss': np.nan, 'accuracy': np.nan})
             except Exception as e:
                 print(f"Server: Error during global model evaluation: {e}")
+                import traceback
+                traceback.print_exc()
                 fl_metrics_history.append({'round': FL_ROUND_COUNT, 'loss': np.nan, 'accuracy': np.nan})
         else:
             print("Server: No clients to evaluate on.")
             fl_metrics_history.append({'round': FL_ROUND_COUNT, 'loss': np.nan, 'accuracy': np.nan})
-
 
     return jsonify(status="success", message="Federated round complete", fl_round_count=FL_ROUND_COUNT)
 
@@ -389,7 +604,6 @@ def reset_fl():
     print("Federated Learning state reset.")
     return jsonify(status="success", message="FL state reset", fl_round_count=FL_ROUND_COUNT)
 
-
 @app.route('/generate', methods=['POST'])
 def generate_text_endpoint():
     """Generates text using the current global model."""
@@ -404,8 +618,7 @@ def generate_text_endpoint():
     temperature = float(data.get('temperature', 0.7))
 
     try:
-        # Ensure the global model is compiled for prediction if it hasn't been
-        if not global_model.optimizer: # Check if compiled
+        if not global_model.optimizer:
              global_model.compile(
                 optimizer=tf.keras.optimizers.SGD(learning_rate=0.01),
                 loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -415,6 +628,8 @@ def generate_text_endpoint():
         return jsonify(status="success", generated_text=generated_text)
     except Exception as e:
         print(f"Error during text generation: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify(status="error", message=f"Failed to generate text: {str(e)}"), 500
 
 @app.route('/metrics', methods=['GET'])
@@ -423,18 +638,27 @@ def get_metrics_history():
     return jsonify(metrics_history=fl_metrics_history)
 
 # --- Client Simulation Function (run by threads on server side) ---
-def simulate_client_training(client_id, server_url):
+def simulate_client_training(client_id, server_url, simulated_delay_seconds=0, max_batches_to_use=None, is_malicious=False):
     """
     Simulates a single client's federated learning process.
     This function will be run in a separate thread.
+    Includes simulated delay, data volume limits, and malicious behavior.
     """
-    print(f"Client: {client_id}: Starting local training simulation.")
+    status_msg = "MALICIOUS" if is_malicious else "NORMAL"
+    print(f"Client {client_id}: Starting ({status_msg}) with delay={simulated_delay_seconds}s, max_batches={max_batches_to_use}...")
     try:
-        # 1. Download global model
+        # 1. Download global model weights
+        print(f"Client {client_id}: Attempting to download global model weights.")
         response = requests.get(f"{server_url}/download_model")
-        response.raise_for_status() # Raise an exception for HTTP errors
+        response.raise_for_status()
         server_weights_json = response.json()['weights']
         server_weights = json_to_weights(server_weights_json)
+        print(f"Client {client_id}: Global model weights downloaded successfully.")
+
+        # Simulate computation delay
+        if simulated_delay_seconds > 0:
+            print(f"Client {client_id}: Simulating {simulated_delay_seconds} seconds of computation delay...")
+            time.sleep(simulated_delay_seconds)
 
         # 2. Create local model and set global weights
         local_model = create_keras_model()
@@ -444,38 +668,70 @@ def simulate_client_training(client_id, server_url):
             loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
             metrics=[tf.keras.metrics.SparseCategoricalAccuracy()]
         )
+        print(f"Client {client_id}: Local model created and compiled with global weights.")
 
-        # 3. Get client's local data
-        local_dataset = client_data_dict.get(client_id)
-        if local_dataset is None:
-            print(f"Client: {client_id}: No data found for this client. Skipping.")
-            return
+        # 3. Get client's local data (now with potential batch limit)
+        # Re-preprocess the dataset for this client with the specific max_batches_to_use
+        # This ensures the client thread gets a dataset with the correct batch limit.
+        _, raw_train_data = tff.simulation.datasets.shakespeare.load_data()
+        local_dataset = preprocess_client_dataset(
+            raw_train_data.create_tf_dataset_for_client(client_id), 
+            num_epochs=LOCAL_EPOCHS, 
+            max_batches_to_use=max_batches_to_use
+        )
+        
+        # Check if the dataset is empty after limiting
+        try:
+            _ = next(iter(local_dataset))
+            print(f"Client {client_id}: Local dataset retrieved and limited to {max_batches_to_use} batches.")
+        except StopIteration:
+            print(f"Client {client_id}: Local dataset is empty after limiting batches. Skipping training and upload.")
+            return # Exit the function, as there's no data to train on
 
         # 4. Train locally
-        # Changed verbose=0 to verbose=1 for console output during training
+        print(f"Client {client_id}: Starting local training for {LOCAL_EPOCHS} epoch(s)...")
         history = local_model.fit(local_dataset, epochs=LOCAL_EPOCHS, verbose=1) 
         local_loss = history.history['loss'][-1]
         local_accuracy = history.history['sparse_categorical_accuracy'][-1]
-        print(f"\nClient: {client_id}: Local training complete. Loss={local_loss:.4f}, Acc={local_accuracy:.4f}")
+        print(f"Client {client_id}: Local training complete. Loss={local_loss:.4f}, Acc={local_accuracy:.4f}")
 
-        # 5. Upload updated weights
-        updated_weights = get_model_weights(local_model)
+        # 5. Calculate update (delta) and apply Differential Privacy
+        local_weights = get_model_weights(local_model)
+        updates = [
+            local_w - server_w for local_w, server_w in zip(local_weights, server_weights)
+        ]
+        
+        # --- Malicious Behavior: Invert updates ---
+        if is_malicious:
+            print(f"Client {client_id}: Applying malicious update inversion!")
+            updates = [u * -1 for u in updates] # Invert the updates
+
+        clipped_updates = clip_l2_norm(updates, L2_NORM_CLIP)
+        dp_updates = add_gaussian_noise(clipped_updates, DP_NOISE_MULTIPLIER, L2_NORM_CLIP)
+        
+        print(f"Client {client_id}: Updates calculated, clipped, and noised for DP.")
+
+        # 6. Upload noised updates
         upload_payload = {
             'client_id': client_id,
-            'weights': weights_to_json(updated_weights),
+            'updates': updates_to_json(dp_updates),
             'metrics': {'loss': float(local_loss), 'accuracy': float(local_accuracy)}
         }
+        print(f"Client {client_id}: Attempting to upload (noised) updates to {server_url}/upload_weights")
         response = requests.post(f"{server_url}/upload_weights", json=upload_payload)
         response.raise_for_status()
-        print(f"Client {client_id}: Weights uploaded successfully.")
+        print(f"Client {client_id}: (Noised) updates uploaded successfully. Server response: {response.json()}")
 
     except requests.exceptions.ConnectionError as e:
-        print(f"Client {client_id}: Connection error to server: {e}")
+        print(f"Client {client_id}: Connection error to server: {e}. Make sure the server is running at {server_url}")
+    except requests.exceptions.RequestException as e:
+        print(f"Client {client_id}: HTTP Request error: {e}. Response text: {e.response.text if e.response else 'N/A'}")
+    except ValueError as e:
+        print(f"Client {client_id}: Data or model error: {e}")
     except Exception as e:
-        print(f"Client {client_id}: An error occurred during simulation: {e}")
+        print(f"Client {client_id}: An unexpected error occurred: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == '__main__':
-    # Run the Flask app
-    # Use threaded=True to allow multiple client threads to run concurrently
-    # debug=True is useful for development but should be False in production
     app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
