@@ -24,8 +24,8 @@ vocab = []
 VOCAB_SIZE = 0
 SEQUENCE_LENGTH = 100
 BATCH_SIZE = 10
-NUM_CLIENTS_PER_ROUND = 2 # Number of clients participating in each round
-LOCAL_EPOCHS = 1 # Number of local epochs for each client in a round
+NUM_CLIENTS_PER_ROUND = 3 # Number of clients participating in each round
+LOCAL_EPOCHS = 5 # Number of local epochs for each client in a round
 FL_ROUND_COUNT = 0 # To keep track of current FL round
 
 # --- Security Constants for Differential Privacy Simulation ---
@@ -33,15 +33,15 @@ L2_NORM_CLIP = 1.0
 DP_NOISE_MULTIPLIER = 0.1 
 
 # --- Simulation Heterogeneity Parameters ---
-MIN_CLIENT_DELAY_SECONDS = 1
-MAX_CLIENT_DELAY_SECONDS = 5
-STRAGGLER_DELAY_SECONDS = 15 # Significantly longer delay for stragglers
-STRAGGLER_COUNT = 0 # Number of stragglers per round
+MIN_CLIENT_DELAY_SECONDS = 0
+MAX_CLIENT_DELAY_SECONDS = 0
+STRAGGLER_DELAY_SECONDS = 10 # Significantly longer delay for stragglers
+STRAGGLER_COUNT = 1 # Number of stragglers per round
 MIN_CLIENT_BATCHES = 5 # Minimum number of batches a client will train on
 MAX_CLIENT_BATCHES = 20 # Maximum number of batches a client will train on
 
 # --- Malicious Client Simulation & Robust Aggregation Parameters ---
-MALICIOUS_CLIENT_COUNT = 0 # Number of clients to simulate as malicious per round
+MALICIOUS_CLIENT_COUNT = 1 # Number of clients to simulate as malicious per round
 TRIM_FRACTION = 0.1 # Fraction of updates to trim from each end for trimmed mean (e.g., 0.1 trims 10% from top and 10% from bottom)
 
 
@@ -188,7 +188,7 @@ def json_to_weights(json_weights):
     numpy_weights = []
     for i, w_list in enumerate(json_weights):
         try:
-            converted_w = np.array(w_list)
+            converted_w = np.array(w_list, dtype=np.float32)
         except Exception as e:
             raise ValueError(f"Could not convert uploaded weight list for layer {i} to numpy array: {e}")
 
@@ -342,7 +342,7 @@ def generate_text(model, start_string, num_generate=500, temperature=0.7):
 @app.route('/')
 def index():
     """Renders the main HTML page."""
-    return render_template('index.html', fl_round_count=FL_ROUND_COUNT)
+    return render_template('index.html', fl_round_count=FL_ROUND_COUNT, num_clients=NUM_CLIENTS_PER_ROUND)
 
 @app.route('/init_fl', methods=['POST'])
 def init_fl():
@@ -720,7 +720,7 @@ def simulate_client_training(client_id, server_url, simulated_delay_seconds=0, m
         print(f"Client {client_id}: Attempting to upload (noised) updates to {server_url}/upload_weights")
         response = requests.post(f"{server_url}/upload_weights", json=upload_payload)
         response.raise_for_status()
-        print(f"Client {client_id}: (Noised) updates uploaded successfully. Server response: {response.json()}")
+        print(f"\nClient {client_id}: (Noised) updates uploaded successfully.\n Server response: {response.json()}")
 
     except requests.exceptions.ConnectionError as e:
         print(f"Client {client_id}: Connection error to server: {e}. Make sure the server is running at {server_url}")
