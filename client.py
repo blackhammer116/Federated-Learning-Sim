@@ -152,7 +152,8 @@ def json_to_weights(json_weights):
     numpy_weights = []
     for i, w_list in enumerate(json_weights):
         try:
-            converted_w = np.array(w_list)
+            # converted_w = np.array(w_list)
+            converted_w = np.array(w_list, dtype=np.float32)
         except Exception as e:
             raise ValueError(f"Could not convert uploaded weight list for layer {i} to numpy array: {e}")
 
@@ -211,6 +212,8 @@ def run_client(client_id, server_url, simulated_delay_seconds=0, max_batches_to_
     
     try:
         # Load and preprocess data for this specific client
+        response = requests.get(f"{server_url}/get_client_behavior")
+        max_batches_to_use = response.json()['max_batches']
         local_dataset = load_client_data(client_id, max_batches_to_use=max_batches_to_use)
         
         # --- Crucial Check: Ensure dataset is not empty ---
